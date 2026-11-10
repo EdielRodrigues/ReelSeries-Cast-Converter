@@ -16,12 +16,17 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Request
+import firebase_admin
+from firebase_admin import auth as firebase_auth
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 app = FastAPI(title="ReelSeries Cast Converter", docs_url=None, redoc_url=None)
 ROOT = Path(tempfile.mkdtemp(prefix="reelcast-"))
 KEY = os.environ.get("CAST_API_KEY", "")
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
+if FIREBASE_PROJECT_ID:
+    firebase_admin.initialize_app(options={"projectId": FIREBASE_PROJECT_ID})
 PUBLIC = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 # Explicitly allow the IPTV provider hostname(s); never relay arbitrary URLs.
 HOSTS = {s.strip().lower() for s in os.environ.get("XTREAM_ALLOWED_HOSTS", "").split(",") if s.strip()}
@@ -33,9 +38,22 @@ class StartRequest(BaseModel):
     url: str
 
 
-def require_key(value: str | None):
-    if not KEY or not value or not hmac.compare_digest(value, KEY):
-        raise HTTPException(401, "Unauthorized")
+def require_auth(authorization: str | None):
+    """Verify Firebase ID token; optionally retain a separate admin API key."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Firebase authentication required")
+    token = authorization[7:].strip()
+    if KEY and hmac.compare_digest(token, KEY):
+        return "admin"
+    if not FIREBASE_PROJECT_ID:
+        raise HTTPException(503, "FIREBASE_PROJECT_ID not configured")
+    try:
+        claims = firebase_auth.verify_id_token(token, check_revoked=False)
+        if not claims.get("uid"):
+            raise ValueError("missing uid")
+        return claims["uid"]
+    except Exception:
+        raise HTTPException(401, "Invalid Firebase ID token")
 
 
 def validate_source(value: str):
@@ -72,12 +90,14 @@ async def terminate():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "configured": bool(KEY and HOSTS and PUBLIC), "active": bool(ACTIVE)}
+    return {"ok": True, "configured": bool(FIREBASE_PROJECT_ID and HOSTS and PUBLIC), "active": bool(ACTIVE)}
 
 
 @app.post("/api/streams")
 async def start(payload: StartRequest, authorization: str | None = Header(default=None)):
-    require_key(authorization.removeprefix("Bearer ") if authorization else None)
+    require_auth(authorization)
+    if not FIREBASE_PROJECT_ID or not HOSTS:
+        raise HTTPException(503, "Firebase authentication or IPTV host allowlist not configured")
     source = validate_source(payload.url)
     if not PUBLIC.startswith("https://"):
         raise HTTPException(503, "PUBLIC_BASE_URL must be HTTPS")
@@ -100,7 +120,7 @@ async def start(payload: StartRequest, authorization: str | None = Header(defaul
 
 @app.delete("/api/streams")
 async def stop(authorization: str | None = Header(default=None)):
-    require_key(authorization.removeprefix("Bearer ") if authorization else None)
+    require_auth(authorization)
     async with LOCK:
         await terminate()
     return {"stopped": True}

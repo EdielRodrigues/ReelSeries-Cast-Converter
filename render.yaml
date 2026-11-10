@@ -6,7 +6,9 @@ services:
     region: oregon
     healthCheckPath: /health
     envVars:
-      - key: CAST_API_KEY
-        generateValue: true
-      - key: PUBLIC_BASE_URL
+      - key: FIREBASE_PROJECT_ID
+        value: smart-tv-c175a
+      - key: XTREAM_ALLOWED_HOSTS
         sync: false
+      - key: PUBLIC_BASE_URL
+        value: https://reelseries-cast-converter.onrender.com
