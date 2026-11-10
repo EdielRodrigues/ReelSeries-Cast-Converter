@@ -52,8 +52,15 @@ def require_auth(authorization: str | None):
         if not claims.get("uid"):
             raise ValueError("missing uid")
         return claims["uid"]
-    except Exception:
-        raise HTTPException(401, "Invalid Firebase ID token")
+    except firebase_auth.ExpiredIdTokenError:
+        raise HTTPException(401, "Firebase token expired")
+    except firebase_auth.InvalidIdTokenError:
+        raise HTTPException(401, "Firebase token invalid or belongs to another project")
+    except Exception as exc:
+        # Do not expose credentials or raw exception text to the caller.
+        import logging
+        logging.getLogger("reelcast.auth").warning("Firebase verification failed: %s", type(exc).__name__)
+        raise HTTPException(503, "Firebase verification temporarily unavailable")
 
 
 def validate_source(value: str):
