@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: reelseries-cast-converter
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: CAST_API_KEY
+        generateValue: true
+      - key: PUBLIC_BASE_URL
+        sync: false
