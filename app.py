@@ -1,12 +1,10 @@
-"""Small authenticated, allowlisted live IPTV to HLS relay for Chromecast.
-
-For a controlled proof of concept. One concurrent stream per instance.
-"""
+"""Authenticated, allowlisted IPTV-to-HLS relay for Chromecast."""
 import asyncio
-import hashlib
 import hmac
 import ipaddress
+import logging
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -15,31 +13,49 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException, Request
-import firebase_admin
-from firebase_admin import auth as firebase_auth
-from fastapi.responses import FileResponse, JSONResponse, Response
+import jwt
+import requests
+from cryptography import x509
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 app = FastAPI(title="ReelSeries Cast Converter", docs_url=None, redoc_url=None)
 ROOT = Path(tempfile.mkdtemp(prefix="reelcast-"))
 KEY = os.environ.get("CAST_API_KEY", "")
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
-if FIREBASE_PROJECT_ID:
-    firebase_admin.initialize_app(options={"projectId": FIREBASE_PROJECT_ID})
 PUBLIC = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-# Explicitly allow the IPTV provider hostname(s); never relay arbitrary URLs.
 HOSTS = {s.strip().lower() for s in os.environ.get("XTREAM_ALLOWED_HOSTS", "").split(",") if s.strip()}
 ACTIVE = {}
 LOCK = asyncio.Lock()
 TTL = 60 * 30
+FIREBASE_CERTS_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
+_CERTS = {"keys": {}, "until": 0.0}
+
 
 class StartRequest(BaseModel):
     url: str
 
 
+def firebase_public_keys(force=False):
+    """Fetch and cache Google's public Firebase token-signing certificates."""
+    now = time.monotonic()
+    if not force and _CERTS["keys"] and now < _CERTS["until"]:
+        return _CERTS["keys"]
+    response = requests.get(FIREBASE_CERTS_URL, timeout=8)
+    response.raise_for_status()
+    keys = {kid: x509.load_pem_x509_certificate(pem.encode("ascii")).public_key()
+            for kid, pem in response.json().items()}
+    if not keys:
+        raise RuntimeError("No Firebase public keys returned")
+    match = re.search(r"max-age=(\d+)", response.headers.get("Cache-Control", ""))
+    ttl = min(int(match.group(1)), 3600) if match else 900
+    _CERTS.update(keys=keys, until=now + max(60, ttl))
+    return keys
+
+
 def require_auth(authorization: str | None):
-    """Verify Firebase ID token; optionally retain a separate admin API key."""
+    """Verify signature, issuer, audience, expiry and user ID without service-account credentials."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Firebase authentication required")
     token = authorization[7:].strip()
@@ -48,19 +64,31 @@ def require_auth(authorization: str | None):
     if not FIREBASE_PROJECT_ID:
         raise HTTPException(503, "FIREBASE_PROJECT_ID not configured")
     try:
-        claims = firebase_auth.verify_id_token(token, check_revoked=False)
-        if not claims.get("uid"):
-            raise ValueError("missing uid")
-        return claims["uid"]
-    except firebase_auth.ExpiredIdTokenError:
-        raise HTTPException(401, "Firebase token expired")
-    except firebase_auth.InvalidIdTokenError:
-        raise HTTPException(401, "Firebase token invalid or belongs to another project")
+        header = jwt.get_unverified_header(token)
+        if header.get("alg") != "RS256" or not header.get("kid"):
+            raise HTTPException(401, "Firebase token invalid")
+        key = firebase_public_keys().get(header["kid"])
+        if key is None:
+            key = firebase_public_keys(force=True).get(header["kid"])
+        if key is None:
+            raise HTTPException(401, "Firebase signing key not recognized")
+        claims = jwt.decode(token, key, algorithms=["RS256"],
+                            audience=FIREBASE_PROJECT_ID,
+                            issuer=f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}",
+                            options={"require": ["exp", "iat", "aud", "iss", "sub", "auth_time"]})
+        uid = claims.get("sub")
+        if not isinstance(uid, str) or not 1 <= len(uid) <= 128:
+            raise HTTPException(401, "Firebase user ID invalid")
+        if claims["iat"] > time.time() or claims["auth_time"] > time.time():
+            raise HTTPException(401, "Firebase token timestamps invalid")
+        return uid
+    except HTTPException:
+        raise
+    except (jwt.PyJWTError, ValueError, KeyError, TypeError):
+        raise HTTPException(401, "Firebase token invalid or expired")
     except Exception as exc:
-        # Do not expose credentials or raw exception text to the caller.
-        import logging
         logging.getLogger("reelcast.auth").warning("Firebase verification failed: %s", type(exc).__name__)
-        raise HTTPException(503, "Firebase verification temporarily unavailable")
+        raise HTTPException(503, "Firebase public-key verification temporarily unavailable")
 
 
 def validate_source(value: str):
@@ -113,13 +141,12 @@ async def start(payload: StartRequest, authorization: str | None = Header(defaul
         token = secrets.token_urlsafe(32)
         folder = Path(tempfile.mkdtemp(dir=ROOT, prefix="stream-"))
         playlist = folder / "index.m3u8"
-        # Copy codecs only: does not fix codecs unsupported by the Chromecast.
         args = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y", "-i", source,
                 "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-f", "hls",
                 "-hls_time", "4", "-hls_list_size", "6", "-hls_flags", "delete_segments+omit_endlist",
                 "-hls_segment_filename", str(folder / "segment%05d.ts"), str(playlist)]
         proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL,
-                                                     stderr=asyncio.subprocess.DEVNULL)
+                                                    stderr=asyncio.subprocess.DEVNULL)
         ACTIVE.update(process=proc, folder=folder, token=token, started=time.monotonic())
     return {"playlist_url": f"{PUBLIC}/hls/{token}/index.m3u8", "expires_in": TTL,
             "note": "Wait a few seconds for the playlist; HLS remux does not transcode codecs."}
